@@ -36,20 +36,18 @@ def fetch_posts():
     """
     Возвращает список (message_id, text, photo_url|None).
     Метод 1: RSSHub (берёт и текст и картинку из enclosure).
-    Метод 2: t.me/s/ парсинг как fallback.
+    Метод 2: t.me/s/ парсинг по блокам как fallback.
     """
     posts = []
 
-    # Метод 1: rsshub
+    # Метод 1: RSSHub
     rss_urls = [
         f"https://rsshub.app/telegram/channel/{SOURCE_CHANNEL}",
         f"https://rss.rssforever.com/telegram/channel/{SOURCE_CHANNEL}",
     ]
-
     for rss_url in rss_urls:
         try:
-            resp = requests.get(rss_url, timeout=15,
-                                headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(rss_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if resp.status_code == 200 and '<item>' in resp.text:
                 root = ET.fromstring(resp.text)
                 items = root.findall('.//item')
@@ -63,7 +61,6 @@ def fetch_posts():
                     text = strip_html(desc)
                     if not text or len(text) < 30:
                         continue
-                    # Фото из enclosure или из <img> в description
                     photo_url = None
                     enclosure = item.find('enclosure')
                     if enclosure is not None:
@@ -79,7 +76,7 @@ def fetch_posts():
         except Exception as e:
             print(f"RSS error ({rss_url}): {e}")
 
-    # Метод 2: t.me/s/ парсинг
+    # Метод 2: t.me/s/ — парсим каждый пост как ЕДИНЫЙ блок
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -90,21 +87,35 @@ def fetch_posts():
                             headers=headers, timeout=20)
         if resp.status_code == 200:
             html = resp.text
-            ids = re.findall(rf'data-post="{SOURCE_CHANNEL}/(\d+)"', html)
-            texts_raw = re.findall(
-                r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-                html, re.DOTALL
-            )
-            photos_raw = re.findall(
-                r'<a class="tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\(\'([^\']+)\'\)',
-                html
-            )
-            for i, mid in enumerate(ids):
-                if i < len(texts_raw):
-                    text = strip_html(texts_raw[i])
-                    if text and len(text) > 30:
-                        photo = photos_raw[i] if i < len(photos_raw) else None
-                        posts.append((int(mid), text, photo))
+            # Разбиваем на блоки по каждому сообщению
+            message_blocks = re.split(r'(?=<div class="tgme_widget_message_wrap)', html)
+            for block in message_blocks:
+                # ID поста
+                m = re.search(rf'data-post="{SOURCE_CHANNEL}/(\d+)"', block)
+                if not m:
+                    continue
+                pid = int(m.group(1))
+
+                # Текст
+                text_m = re.search(
+                    r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+                    block, re.DOTALL
+                )
+                text = strip_html(text_m.group(1)) if text_m else ""
+                if not text or len(text) < 30:
+                    continue
+
+                # Фото — ищем background-image в том же блоке
+                photo_url = None
+                photo_m = re.search(
+                    r'background-image:url\([\'"]?([^\'")\s]+)[\'"]?\)',
+                    block
+                )
+                if photo_m:
+                    photo_url = photo_m.group(1)
+
+                posts.append((pid, text, photo_url))
+
             if posts:
                 print(f"Fetched {len(posts)} posts via t.me/s/")
                 return posts[-10:]
@@ -174,6 +185,7 @@ def post_to_telegram(text: str, photo_url: str | None = None) -> bool:
                 payload["parse_mode"] = parse_mode
             resp = requests.post(f"{base}/sendPhoto", json=payload, timeout=20)
             if resp.status_code == 200:
+                print(f"✅ Posted with photo (parse_mode={parse_mode})")
                 return True
             print(f"sendPhoto error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
         # Если фото не прошло — постим без него
@@ -186,6 +198,7 @@ def post_to_telegram(text: str, photo_url: str | None = None) -> bool:
             payload["parse_mode"] = parse_mode
         resp = requests.post(f"{base}/sendMessage", json=payload, timeout=15)
         if resp.status_code == 200:
+            print(f"✅ Posted text-only (parse_mode={parse_mode})")
             return True
         print(f"sendMessage error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
     return False
@@ -231,7 +244,6 @@ def main():
     print(f"Posting to {TARGET_CHANNEL}...")
 
     if post_to_telegram(rewritten, photo_url):
-        print("✅ Done!")
         posted_ids.add(msg_id)
         state["last_post_id"] = max(last_id, msg_id)
         state["posted_ids"] = list(posted_ids)[-100:]
