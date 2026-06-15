@@ -34,12 +34,13 @@ def strip_html(text):
 
 def fetch_posts():
     """
-    Получаем посты через RSS2 от rsshub (публичный, бесплатный).
-    Fallback: прямой парсинг t.me/s/
+    Возвращает список (message_id, text, photo_url|None).
+    Метод 1: RSSHub (берёт и текст и картинку из enclosure).
+    Метод 2: t.me/s/ парсинг как fallback.
     """
     posts = []
 
-    # Метод 1: rsshub публичный инстанс
+    # Метод 1: rsshub
     rss_urls = [
         f"https://rsshub.app/telegram/channel/{SOURCE_CHANNEL}",
         f"https://rss.rssforever.com/telegram/channel/{SOURCE_CHANNEL}",
@@ -55,20 +56,30 @@ def fetch_posts():
                 for item in items[-10:]:
                     link = item.findtext('link', '')
                     desc = item.findtext('description', '')
-                    # ID из ссылки вида https://t.me/biggeekru/12345
                     m = re.search(r'/(\d+)$', link)
-                    if m and desc:
-                        pid = int(m.group(1))
-                        text = strip_html(desc)
-                        if text and len(text) > 30:
-                            posts.append((pid, text))
+                    if not m or not desc:
+                        continue
+                    pid = int(m.group(1))
+                    text = strip_html(desc)
+                    if not text or len(text) < 30:
+                        continue
+                    # Фото из enclosure или из <img> в description
+                    photo_url = None
+                    enclosure = item.find('enclosure')
+                    if enclosure is not None:
+                        photo_url = enclosure.get('url')
+                    if not photo_url:
+                        img_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc)
+                        if img_m:
+                            photo_url = img_m.group(1)
+                    posts.append((pid, text, photo_url))
                 if posts:
                     print(f"Fetched {len(posts)} posts via RSS: {rss_url}")
                     return posts
         except Exception as e:
             print(f"RSS error ({rss_url}): {e}")
 
-    # Метод 2: t.me/s/ парсинг (если RSS недоступен)
+    # Метод 2: t.me/s/ парсинг
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -84,11 +95,16 @@ def fetch_posts():
                 r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
                 html, re.DOTALL
             )
+            photos_raw = re.findall(
+                r'<a class="tgme_widget_message_photo_wrap[^"]*"[^>]*style="[^"]*background-image:url\(\'([^\']+)\'\)',
+                html
+            )
             for i, mid in enumerate(ids):
                 if i < len(texts_raw):
                     text = strip_html(texts_raw[i])
                     if text and len(text) > 30:
-                        posts.append((int(mid), text))
+                        photo = photos_raw[i] if i < len(photos_raw) else None
+                        posts.append((int(mid), text, photo))
             if posts:
                 print(f"Fetched {len(posts)} posts via t.me/s/")
                 return posts[-10:]
@@ -118,9 +134,10 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @yellauz, и�
 1. Сохраняй стиль оригинала: эмодзи в начале, живой разговорный язык, хэштеги если были
 2. Убирай: ссылки на российские магазины (biggeek.ru, DNS, Citilink и др.), госуслуги, рублёвые цены
 3. Фразы "в России", "российские пользователи", "для россиян" → убирай или заменяй на "в Узбекистане" / "у нас" где уместно
-4. Если пост про конкретный гаджет — добавь в конце: "Доступно в yella.uz 🛒"
-5. Если пост про игры/кино/сериалы/технологии в целом — не добавляй упоминание yella.uz
-6. Отвечай ТОЛЬКО готовым текстом поста, без пояснений и кавычек"""
+4. НЕ добавляй никакие подписи, ссылки на yella.uz или призывы к покупке — это делается отдельно
+5. Отвечай ТОЛЬКО готовым текстом поста, без пояснений и кавычек"""
+
+YELLA_SIGNATURE = "\n\n🛒 yella.uz — интернет-магазин электроники"
 
 def rewrite_post(text: str) -> str | None:
     resp = requests.post(
@@ -141,16 +158,36 @@ def rewrite_post(text: str) -> str | None:
     return resp.json()["choices"][0]["message"]["content"].strip()
 
 # ── Post to Telegram ─────────────────────────────────────────────────────────
-def post_to_telegram(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def post_to_telegram(text: str, photo_url: str | None = None) -> bool:
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    full_text = text + YELLA_SIGNATURE
+
+    if photo_url:
+        # Пробуем sendPhoto с caption
+        for parse_mode in ["HTML", None]:
+            payload = {
+                "chat_id": TARGET_CHANNEL,
+                "photo": photo_url,
+                "caption": full_text,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            resp = requests.post(f"{base}/sendPhoto", json=payload, timeout=20)
+            if resp.status_code == 200:
+                return True
+            print(f"sendPhoto error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
+        # Если фото не прошло — постим без него
+        print("Photo failed, falling back to text-only")
+
+    # sendMessage (text only)
     for parse_mode in ["HTML", None]:
-        payload = {"chat_id": TARGET_CHANNEL, "text": text}
+        payload = {"chat_id": TARGET_CHANNEL, "text": full_text}
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = requests.post(f"{base}/sendMessage", json=payload, timeout=15)
         if resp.status_code == 200:
             return True
-        print(f"Telegram error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
+        print(f"sendMessage error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
     return False
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -165,7 +202,7 @@ def main():
     print(f"Total fetched: {len(posts)}")
 
     # Только новые, ещё не постившиеся
-    new_posts = [(pid, txt) for pid, txt in posts
+    new_posts = [(pid, txt, photo) for pid, txt, photo in posts
                  if pid > last_id and pid not in posted_ids]
     print(f"New posts: {len(new_posts)}")
 
@@ -174,7 +211,7 @@ def main():
         return
 
     # Берём самый свежий 1 пост за запуск
-    msg_id, text = new_posts[-1]
+    msg_id, text, photo_url = new_posts[-1]
 
     if should_skip(text):
         print(f"Skipping post {msg_id} (filtered)")
@@ -182,7 +219,7 @@ def main():
         save_state(state)
         return
 
-    print(f"Rewriting post {msg_id}...")
+    print(f"Rewriting post {msg_id}... photo: {photo_url or 'none'}")
     print(f"Original: {text[:150]}...")
 
     rewritten = rewrite_post(text)
@@ -193,7 +230,7 @@ def main():
     print(f"Rewritten: {rewritten[:150]}...")
     print(f"Posting to {TARGET_CHANNEL}...")
 
-    if post_to_telegram(rewritten):
+    if post_to_telegram(rewritten, photo_url):
         print("✅ Done!")
         posted_ids.add(msg_id)
         state["last_post_id"] = max(last_id, msg_id)
