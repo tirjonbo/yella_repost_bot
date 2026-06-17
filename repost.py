@@ -35,7 +35,7 @@ def strip_html(text):
 def fetch_posts():
     """
     Возвращает список (message_id, text, photo_url|None).
-    Метод 1: RSSHub (берёт и текст и картинку из enclosure).
+    Метод 1: RSSHub.
     Метод 2: t.me/s/ парсинг по блокам как fallback.
     """
     posts = []
@@ -174,21 +174,24 @@ def post_to_telegram(text: str, photo_url: str | None = None) -> bool:
     full_text = text + YELLA_SIGNATURE
 
     if photo_url:
-        # Пробуем sendPhoto с caption
-        for parse_mode in ["HTML", None]:
-            payload = {
-                "chat_id": TARGET_CHANNEL,
-                "photo": photo_url,
-                "caption": full_text,
-            }
-            if parse_mode:
-                payload["parse_mode"] = parse_mode
-            resp = requests.post(f"{base}/sendPhoto", json=payload, timeout=20)
-            if resp.status_code == 200:
-                print(f"✅ Posted with photo (parse_mode={parse_mode})")
-                return True
-            print(f"sendPhoto error ({parse_mode}): {resp.status_code} {resp.text[:200]}")
-        # Если фото не прошло — постим без него
+        # Скачиваем фото сами — Telegram не может достучаться до cdn.telesco.pe
+        try:
+            img_resp = requests.get(photo_url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            if img_resp.status_code == 200:
+                files = {"photo": ("photo.jpg", img_resp.content, "image/jpeg")}
+                data = {"chat_id": TARGET_CHANNEL, "caption": full_text}
+                resp = requests.post(f"{base}/sendPhoto", data=data, files=files, timeout=30)
+                if resp.status_code == 200:
+                    print("✅ Posted with photo (upload)")
+                    return True
+                print(f"sendPhoto upload error: {resp.status_code} {resp.text[:200]}")
+            else:
+                print(f"Failed to download photo: {img_resp.status_code}")
+        except Exception as e:
+            print(f"Photo download/upload error: {e}")
+
         print("Photo failed, falling back to text-only")
 
     # sendMessage (text only)
