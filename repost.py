@@ -5,11 +5,11 @@ import requests
 import xml.etree.ElementTree as ET
 
 # ── Config ──────────────────────────────────────────────────────────────────
-SOURCE_CHANNEL  = "exploitex"
-BOT_TOKEN       = os.environ["VERTEX_BOT_TOKEN"]
-TARGET_CHANNEL  = "@vertex_ii"
+SOURCE_CHANNEL  = "biggeekru"
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+TARGET_CHANNEL  = "@yellauz"
 GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
-STATE_FILE      = "vertex_state.json"
+STATE_FILE      = "state.json"
 
 # ── State ────────────────────────────────────────────────────────────────────
 def load_state():
@@ -174,34 +174,34 @@ def should_skip(text: str) -> bool:
     return any(kw in t for kw in SKIP_KEYWORDS)
 
 # ── Rewrite via Groq ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Ты — редактор Telegram-канала @vertex_ii для IT и бизнес-аудитории Узбекистана.
+SYSTEM_PROMPT = """Ты — редактор Telegram-канала @yellauz, интернет-магазина электроники в Узбекистане.
 
-Задача: адаптировать технологический пост под узбекистанскую аудиторию, оформить в двуязычном формате.
+Задача: адаптировать технологический пост из российского канала Big Geek под аудиторию Узбекистана.
 
 Тебе передаётся текст поста в HTML формате (теги <b>, <a href="...">).
 
 Правила:
-1. Убирай всё про Россию, российские сервисы, рублёвые цены, РКН
-2. СТРУКТУРА — копируй структуру оригинала максимально точно:
-   - Абзацы, списки, порядок элементов — всё сохраняй
-   - Если есть финальный призыв ("Забираем здесь", "Попробуйте") — сохраняй
-3. ФОРМАТИРОВАНИЕ — сохраняй HTML теги:
-   - <b>жирный</b> — для ключевых слов и названий как в оригинале
-   - <a href="URL">текст ссылки</a> — ВСЕ ссылки из оригинала ОБЯЗАТЕЛЬНО сохраняй
-4. ЭМОДЗИ — максимум 1 в начале, только если уместно. Внутри текста не использовать
-5. НЕ добавляй свои ссылки, хэштеги, призывы купить
+1. Убирай: ссылки на российские магазины (biggeek.ru, DNS, Citilink и др.), госуслуги, рублёвые цены
+2. Фразы "в России", "российские пользователи", "для россиян" → убирай или заменяй на "в Узбекистане" / "у нас" где уместно
+3. СТРУКТУРА — копируй структуру оригинала максимально точно:
+   - Абзацы разделяй пустой строкой (\n\n) как в оригинале
+   - Списки оформляй через — (тире) если в оригинале список
+   - Финальный призыв если есть — сохраняй
+4. ФОРМАТИРОВАНИЕ — сохраняй HTML теги:
+   - <b>жирный</b> — для ключевых слов, названий устройств и брендов
+   - <a href="URL">текст</a> — ВСЕ ссылки из оригинала ОБЯЗАТЕЛЬНО сохраняй
+5. ХЭШТЕГИ — если были в оригинале, оставь максимум 5 самых важных, вынеси отдельным абзацем в самый конец
+6. НЕ добавляй подписи, ссылки на yella.uz или призывы к покупке
 
-Формат ответа — строго JSON:
+Формат ответа — строго JSON без лишнего текста:
 {
-  "ru": "Русская версия с HTML тегами <b> и <a href=...>. Структура как в оригинале.",
-  "uz": "O'zbek versiyasi. Xuddi shu HTML teglar va tuzilma. 30-40% qisqaroq.",
+  "ru": "Готовый текст поста с HTML тегами и абзацами через \\n\\n.",
   "skip": false
 }
 
-Если пост про Россию/российское — {"skip": true}.
-Узбекская версия: тот же смысл, та же структура, те же ссылки, короче на 30-40%."""
+Если пост не про технологии или электронику — {"skip": true}."""
 
-VERTEX_SIGNATURE = "\n\n⚡️ @vertex_ii — IT va texnologiyalar"
+YELLA_SIGNATURE = "\n\n⚡️ <a href=\"https://t.me/yellauz\">@yellauz</a>"
 
 def rewrite_post(html_text: str) -> dict | None:
     resp = requests.post(
@@ -231,9 +231,7 @@ def rewrite_post(html_text: str) -> dict | None:
 # ── Format post ──────────────────────────────────────────────────────────────
 def format_post(data: dict) -> str:
     ru = data.get("ru", "").strip()
-    uz = data.get("uz", "").strip()
-    divider = "\n\n— — —\n\n"
-    return ru + divider + uz + VERTEX_SIGNATURE
+    return ru + YELLA_SIGNATURE
 
 # ── Post to Telegram ─────────────────────────────────────────────────────────
 def post_to_telegram(text: str, media_bytes: bytes | None, media_type: str | None) -> bool:
@@ -317,14 +315,13 @@ def main():
         return
 
     if result.get("skip"):
-        print(f"Groq decided to skip post {msg_id} (Russia-related)")
+        print(f"Groq decided to skip post {msg_id}")
         state["last_post_id"] = max(last_id, msg_id)
         save_state(state)
         return
 
     full_text = format_post(result)
-    print(f"RU: {result.get('ru', '')[:100]}...")
-    print(f"UZ: {result.get('uz', '')[:100]}...")
+    print(f"Rewritten: {result.get('ru', '')[:100]}...")
     print(f"Posting to {TARGET_CHANNEL}...")
 
     if post_to_telegram(full_text, media_bytes, media_type):
