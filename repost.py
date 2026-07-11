@@ -5,18 +5,33 @@ import requests
 import xml.etree.ElementTree as ET
 
 # ── Config ──────────────────────────────────────────────────────────────────
-SOURCE_CHANNEL  = "biggeekru"
-BOT_TOKEN       = os.environ["BOT_TOKEN"]
-TARGET_CHANNEL  = "@yellauz"
-GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
-STATE_FILE      = "state.json"
+SOURCE_CHANNELS = [
+    "biggeekru",   # BigGeek — техника, гаджеты, игры
+    "rbtshki",     # Роботишки — техника, путешествия, жизнь
+]
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+TARGET_CHANNEL = "@yellauz"
+GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
+STATE_FILE     = "state.json"
+
+# YouTube/VK ссылки самих каналов — пропускаем их собственный контент
+OWN_CONTENT_URLS = [
+    "youtube.com/biggeek", "youtu.be/biggeek",
+    "@biggeek", "biggeek.ru/video",
+    "youtube.com/@rbtshki", "youtu.be/rbtshki",
+    "vk.com/rbtshki", "@rbtshki",
+]
 
 # ── State ────────────────────────────────────────────────────────────────────
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"last_post_id": 0, "posted_ids": []}
+    return {
+        "last_ids": {"biggeekru": 0, "rbtshki": 0},
+        "posted_ids": [],
+        "last_channel_index": 0
+    }
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -26,15 +41,23 @@ def save_state(state):
 def clean_html_for_telegram(text):
     if not text:
         return ""
+    # Абзацы сохраняем как двойной перенос
+    text = re.sub(r'</p>\s*<p[^>]*>', '\n\n', text)
+    text = re.sub(r'<p[^>]*>', '', text)
+    text = re.sub(r'</p>', '\n\n', text)
     text = re.sub(r'<br\s*/?>', '\n', text)
+    # Форматирование
     text = re.sub(r'<strong([^>]*)>', '<b>', text)
     text = re.sub(r'</strong>', '</b>', text)
     text = re.sub(r'<em([^>]*)>', '<i>', text)
     text = re.sub(r'</em>', '</i>', text)
+    # Ссылки — оставляем только href
     text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>', r'<a href="\1">', text)
+    # Убираем всё остальное кроме разрешённых тегов Telegram
     text = re.sub(r'<(?!/?(b|i|a)(\s|>|/))[^>]+>', '', text)
     text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>') \
                .replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 def html_to_plain(text):
@@ -46,13 +69,13 @@ def html_to_plain(text):
                .replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
     return text.strip()
 
-# ── Fetch posts ──────────────────────────────────────────────────────────────
-def fetch_posts():
+# ── Fetch posts from one channel ─────────────────────────────────────────────
+def fetch_posts(channel: str) -> list:
     posts = []
 
+    # Метод 1: RSSHub
     rss_urls = [
-        f"https://rsshub.app/telegram/channel/{SOURCE_CHANNEL}",
-        f"https://rss.rssforever.com/telegram/channel/{SOURCE_CHANNEL}",
+        f"https://rsshub.app/telegram/channel/{channel}",
     ]
     for rss_url in rss_urls:
         try:
@@ -95,23 +118,24 @@ def fetch_posts():
                             media_type = 'photo'
                     posts.append((pid, html_text, plain_text, media_url, media_type))
                 if posts:
-                    print(f"Fetched {len(posts)} posts via RSS: {rss_url}")
+                    print(f"Fetched {len(posts)} posts via RSS from @{channel}")
                     return posts
         except Exception as e:
             print(f"RSS error ({rss_url}): {e}")
 
+    # Метод 2: t.me/s/ по блокам
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "ru-RU,ru;q=0.9",
         }
-        resp = requests.get(f"https://t.me/s/{SOURCE_CHANNEL}", headers=headers, timeout=20)
+        resp = requests.get(f"https://t.me/s/{channel}", headers=headers, timeout=20)
         if resp.status_code == 200:
             html = resp.text
             message_blocks = re.split(r'(?=<div class="tgme_widget_message_wrap)', html)
             for block in message_blocks:
-                m = re.search(rf'data-post="{SOURCE_CHANNEL}/(\d+)"', block)
+                m = re.search(rf'data-post="{channel}/(\d+)"', block)
                 if not m:
                     continue
                 pid = int(m.group(1))
@@ -138,7 +162,7 @@ def fetch_posts():
                         media_type = 'photo'
                 posts.append((pid, html_text, plain_text, media_url, media_type))
             if posts:
-                print(f"Fetched {len(posts)} posts via t.me/s/")
+                print(f"Fetched {len(posts)} posts via t.me/s/ from @{channel}")
                 return posts[-15:]
     except Exception as e:
         print(f"t.me/s/ error: {e}")
@@ -158,48 +182,105 @@ def download_media(url: str) -> bytes | None:
         print(f"Media download error: {e}")
     return None
 
+def get_video_via_telegram(channel: str, post_id: int) -> bytes | None:
+    """Скачиваем видео через Telegram Bot API — форвардим пост и берём file_id."""
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    try:
+        me_resp = requests.get(f"{base}/getMe", timeout=10)
+        if me_resp.status_code != 200:
+            return None
+        bot_id = me_resp.json()["result"]["id"]
+
+        fwd = requests.post(f"{base}/forwardMessage", json={
+            "chat_id": bot_id,
+            "from_chat_id": f"@{channel}",
+            "message_id": post_id
+        }, timeout=15)
+
+        if fwd.status_code != 200:
+            print(f"Forward failed: {fwd.text[:200]}")
+            return None
+
+        msg = fwd.json().get("result", {})
+        video = msg.get("video") or msg.get("animation")
+        if not video:
+            print("No video in forwarded message")
+            return None
+
+        file_id = video["file_id"]
+        print(f"Got file_id from Telegram: {file_id[:30]}...")
+
+        file_resp = requests.get(f"{base}/getFile", params={"file_id": file_id}, timeout=10)
+        if file_resp.status_code != 200:
+            return None
+
+        file_path = file_resp.json()["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+        dl = requests.get(file_url, timeout=60)
+        if dl.status_code == 200:
+            print(f"Video downloaded via Telegram: {len(dl.content)/1024:.0f} KB")
+            return dl.content
+    except Exception as e:
+        print(f"get_video_via_telegram error: {e}")
+    return None
+
 # ── Filter ───────────────────────────────────────────────────────────────────
 SKIP_KEYWORDS = [
-    "в россии", "для россиян", "российск", "росси ", "россия",
-    "русских", "русские", "русский пользовател",
-    "ркн", "госуслуг", "роскомнадзор", "заблокировал",
+    "ркн", "госуслуг", "роскомнадзор",
     "#партнерский", "конкурс", "розыгрыш", "участвовать", "победитель",
     "промокод", "купить рекламу",
-    "вконтакте", "яндекс", "сбербанк", "тинькофф", "gosuslugi",
+    "сбербанк", "тинькофф", "gosuslugi",
     "dns-shop", "citilink", "mvideo", "eldorado",
 ]
 
-def should_skip(text: str) -> bool:
+def should_skip(text: str, html_text: str) -> tuple[bool, str]:
     t = text.lower()
-    return any(kw in t for kw in SKIP_KEYWORDS)
+    h = html_text.lower()
+
+    # Фильтр по ключевым словам
+    for kw in SKIP_KEYWORDS:
+        if kw in t:
+            return True, f"keyword: {kw}"
+
+    # Фильтр собственного контента каналов (YouTube/VK ролики самих авторов)
+    for url in OWN_CONTENT_URLS:
+        if url.lower() in h:
+            return True, f"own content: {url}"
+
+    return False, ""
 
 # ── Rewrite via Groq ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Ты — редактор Telegram-канала @yellauz, интернет-магазина электроники в Узбекистане.
+SYSTEM_PROMPT = """Ты — редактор Telegram-канала @yellauz — живого канала про гаджеты, технологии, игры, путешествия и всё интересное для аудитории Узбекистана.
 
-Задача: адаптировать технологический пост из российского канала Big Geek под аудиторию Узбекистана.
+Задача: адаптировать пост под нашу аудиторию. Пиши живо, как рассказываешь другу.
 
-Тебе передаётся текст поста в HTML формате (теги <b>, <a href="...">).
+Тебе передаётся текст поста в HTML формате (теги <b>, <i>, <a href="...">).
 
 Правила:
 1. Убирай: ссылки на российские магазины (biggeek.ru, DNS, Citilink и др.), госуслуги, рублёвые цены
-2. Фразы "в России", "российские пользователи", "для россиян" → убирай или заменяй на "в Узбекистане" / "у нас" где уместно
-3. СТРУКТУРА — копируй структуру оригинала максимально точно:
-   - Абзацы разделяй пустой строкой (\n\n) как в оригинале
-   - Списки оформляй через — (тире) если в оригинале список
+2. Фразы "в России", "для россиян" → убирай или нейтрализуй
+3. СТИЛЬ — живой, разговорный, с характером:
+   - Можно добавить короткий комментарий редакции в конце (1 фраза)
+   - Вопрос аудитории в конце если уместно — хорошо
+4. СТРУКТУРА — копируй структуру оригинала точно:
+   - Абзацы разделяй пустой строкой (\n\n)
+   - Списки через — (тире) если в оригинале список
    - Финальный призыв если есть — сохраняй
-4. ФОРМАТИРОВАНИЕ — сохраняй HTML теги:
-   - <b>жирный</b> — для ключевых слов, названий устройств и брендов
-   - <a href="URL">текст</a> — ВСЕ ссылки из оригинала ОБЯЗАТЕЛЬНО сохраняй
-5. ХЭШТЕГИ — если были в оригинале, оставь максимум 5 самых важных, вынеси отдельным абзацем в самый конец
-6. НЕ добавляй подписи, ссылки на yella.uz или призывы к покупке
+5. ФОРМАТИРОВАНИЕ — обязательно сохраняй HTML теги:
+   - <b>жирный</b> — для названий устройств, игр, брендов, ключевых фактов
+   - <i>курсив</i> — для цитат или акцентов если были
+   - <a href="URL">текст</a> — ВСЕ ссылки из оригинала сохраняй
+6. ХЭШТЕГИ — максимум 3 самых важных, отдельным абзацем в конце
+7. НЕ добавляй подписи, ссылки на yella.uz или призывы к покупке
 
 Формат ответа — строго JSON без лишнего текста:
 {
-  "ru": "Готовый текст поста с HTML тегами и абзацами через \\n\\n.",
+  "ru": "Готовый текст поста с HTML тегами и абзацами.",
   "skip": false
 }
 
-Если пост не про технологии или электронику — {"skip": true}."""
+Скипать {"skip": true} только если пост про российскую политику, госуслуги или прямую рекламу."""
 
 YELLA_SIGNATURE = "\n\n⚡️ <a href=\"https://t.me/yellauz\">@yellauz</a>"
 
@@ -213,7 +294,7 @@ def rewrite_post(html_text: str) -> dict | None:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": html_text}
             ],
-            "temperature": 0.6,
+            "temperature": 0.7,
             "max_tokens": 1500
         },
         timeout=30
@@ -271,12 +352,17 @@ def post_to_telegram(text: str, media_bytes: bytes | None, media_type: str | Non
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     state = load_state()
-    last_id = state["last_post_id"]
     posted_ids = set(state.get("posted_ids", []))
 
-    print(f"Last posted ID: {last_id}")
+    # Определяем какой канал обрабатываем сейчас — чередуем по очереди
+    last_idx = state.get("last_channel_index", 0)
+    channel_idx = (last_idx + 1) % len(SOURCE_CHANNELS)
+    channel = SOURCE_CHANNELS[channel_idx]
+    last_id = state.get("last_ids", {}).get(channel, 0)
 
-    posts = fetch_posts()
+    print(f"Processing channel: @{channel} (last_id: {last_id})")
+
+    posts = fetch_posts(channel)
     print(f"Total fetched: {len(posts)}")
 
     new_posts = [(pid, ht, pt, murl, mtype) for pid, ht, pt, murl, mtype in posts
@@ -285,19 +371,27 @@ def main():
 
     if not new_posts:
         print("Nothing new. Done.")
+        # Всё равно сохраняем смену канала
+        state["last_channel_index"] = channel_idx
+        save_state(state)
         return
 
+    # Берём самый новый пост
     msg_id, html_text, plain_text, media_url, media_type = new_posts[-1]
 
-    if should_skip(plain_text):
-        print(f"Skipping post {msg_id} (keyword filter)")
-        state["last_post_id"] = max(last_id, msg_id)
+    skip, reason = should_skip(plain_text, html_text)
+    if skip:
+        print(f"Skipping post {msg_id} ({reason})")
+        state["last_ids"] = state.get("last_ids", {})
+        state["last_ids"][channel] = max(last_id, msg_id)
+        state["last_channel_index"] = channel_idx
         save_state(state)
         return
 
     print(f"Processing post {msg_id}... media: {media_type or 'none'} {(media_url or '')[:80]}")
     print(f"Original: {plain_text[:150]}...")
 
+    # Скачиваем медиа
     media_bytes = None
     if media_url:
         print(f"Downloading {media_type}...")
@@ -305,8 +399,14 @@ def main():
         if media_bytes:
             print(f"Downloaded: {len(media_bytes) / 1024:.1f} KB")
         else:
-            print("Media download failed, will post text-only")
+            print("Direct download failed")
+            if media_type == 'video':
+                print("Trying via Telegram forward...")
+                media_bytes = get_video_via_telegram(channel, msg_id)
+            if not media_bytes:
+                print("Media unavailable, posting text-only")
 
+    # Переписываем через Groq
     print("Rewriting via Groq...")
     result = rewrite_post(html_text)
 
@@ -315,8 +415,10 @@ def main():
         return
 
     if result.get("skip"):
-        print(f"Groq decided to skip post {msg_id}")
-        state["last_post_id"] = max(last_id, msg_id)
+        print(f"Groq skipped post {msg_id}")
+        state["last_ids"] = state.get("last_ids", {})
+        state["last_ids"][channel] = max(last_id, msg_id)
+        state["last_channel_index"] = channel_idx
         save_state(state)
         return
 
@@ -326,8 +428,10 @@ def main():
 
     if post_to_telegram(full_text, media_bytes, media_type):
         posted_ids.add(msg_id)
-        state["last_post_id"] = max(last_id, msg_id)
-        state["posted_ids"] = list(posted_ids)[-100:]
+        state["last_ids"] = state.get("last_ids", {})
+        state["last_ids"][channel] = max(last_id, msg_id)
+        state["last_channel_index"] = channel_idx
+        state["posted_ids"] = list(posted_ids)[-200:]
         save_state(state)
     else:
         print("❌ Failed to post")
