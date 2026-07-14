@@ -285,29 +285,46 @@ SYSTEM_PROMPT = """Ты — редактор Telegram-канала @yellauz — 
 YELLA_SIGNATURE = "\n\n⚡️ <a href=\"https://t.me/yellauz\">@yellauz</a>"
 
 def rewrite_post(html_text: str) -> dict | None:
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": html_text}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 1500
-        },
-        timeout=30
-    )
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    raw = re.sub(r'^```json\s*', '', raw)
-    raw = re.sub(r'\s*```$', '', raw)
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        print(f"JSON parse error: {e}\nRaw: {raw[:300]}")
-        return None
+    import time
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": html_text}
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 1500
+                },
+                timeout=30
+            )
+            if resp.status_code == 429:
+                wait = 15 * (attempt + 1)
+                print(f"Groq rate limit (429), waiting {wait}s... (attempt {attempt+1}/3)")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            raw = re.sub(r'^```json\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+            try:
+                return json.loads(raw)
+            except Exception as e:
+                print(f"JSON parse error: {e}\nRaw: {raw[:300]}")
+                return None
+        except requests.exceptions.HTTPError as e:
+            print(f"Groq HTTP error: {e}")
+            if attempt < 2:
+                time.sleep(15)
+        except Exception as e:
+            print(f"Groq error: {e}")
+            return None
+    print("Groq failed after 3 attempts")
+    return None
 
 # ── Format post ──────────────────────────────────────────────────────────────
 def format_post(data: dict) -> str:
