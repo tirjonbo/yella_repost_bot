@@ -2,8 +2,8 @@ name: Yella Repost Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'   # каждый час
-  workflow_dispatch:        # ручной запуск для теста
+    - cron: '10 * * * *'   # каждый час в :10 (не пересекается с promo)
+  workflow_dispatch:
 
 jobs:
   repost:
