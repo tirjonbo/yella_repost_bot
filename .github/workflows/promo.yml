@@ -2,7 +2,7 @@ name: Yella Promo Bot
 
 on:
   schedule:
-    - cron: '0 5,13 * * *'    # 10:00 и 18:00 по Ташкенту (UTC+5)
+    - cron: '30 5,13 * * *'   # 10:30 и 18:30 по Ташкенту (UTC+5), в :30 не пересекается с repost
   workflow_dispatch:
 
 jobs:
